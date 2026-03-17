@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Traceroute Map</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: #1e293b;
+            padding: 16px 24px;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+        h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #38bdf8;
+            white-space: nowrap;
+        }
+        .input-group {
+            display: flex;
+            gap: 8px;
+            flex: 1;
+            min-width: 300px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 8px 16px;
+            border: 1px solid #475569;
+            border-radius: 6px;
+            background: #0f172a;
+            color: #e2e8f0;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        input[type="text"]:focus { border-color: #38bdf8; }
+        button {
+            padding: 8px 24px;
+            border: none;
+            border-radius: 6px;
+            background: #2563eb;
+            color: white;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: background 0.2s;
+            white-space: nowrap;
+        }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        .main-content {
+            display: flex;
+            flex: 1;
+            overflow: hidden;
+        }
+        #map {
+            flex: 1;
+            min-height: 400px;
+        }
+        .sidebar {
+            width: 360px;
+            background: #1e293b;
+            border-left: 1px solid #334155;
+            overflow-y: auto;
+            padding: 16px;
+        }
+        .status {
+            padding: 12px;
+            margin-bottom: 12px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+        .status.loading { background: #1e3a5f; color: #7dd3fc; }
+        .status.error { background: #3b1219; color: #fca5a5; }
+        .status.success { background: #14352a; color: #86efac; }
+        .hop-list { list-style: none; }
+        .hop-item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .hop-item:hover { border-color: #38bdf8; }
+        .hop-item.no-geo { opacity: 0.5; }
+        .hop-num {
+            display: inline-block;
+            width: 28px;
+            font-weight: 700;
+            color: #38bdf8;
+        }
+        .hop-ip { font-family: monospace; color: #f1f5f9; }
+        .hop-rtt { color: #94a3b8; margin-left: 8px; }
+        .hop-location {
+            margin-top: 4px;
+            padding-left: 28px;
+            color: #94a3b8;
+            font-size: 0.8rem;
+        }
+        .hop-isp {
+            margin-top: 2px;
+            padding-left: 28px;
+            color: #64748b;
+            font-size: 0.75rem;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 40px 16px;
+            color: #64748b;
+        }
+        .empty-state p { margin-top: 8px; font-size: 0.9rem; }
+        @media (max-width: 768px) {
+            .main-content { flex-direction: column; }
+            .sidebar { width: 100%; max-height: 40vh; border-left: none; border-top: 1px solid #334155; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Traceroute Map</h1>
+        <div class="input-group">
+            <input type="text" id="target" placeholder="ドメイン or IPアドレス (例: google.com)" />
+            <select id="method" style="padding:8px 12px;border:1px solid #475569;border-radius:6px;background:#0f172a;color:#e2e8f0;font-size:0.9rem;">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="icmp">ICMP</option>
+            </select>
+            <button id="traceBtn" onclick="doTrace()">Trace</button>
+        </div>
+    </header>
+    <div class="main-content">
+        <div id="map"></div>
+        <div class="sidebar">
+            <div id="status"></div>
+            <div id="hopList">
+                <div class="empty-state">
+                    <p>ドメインまたはIPアドレスを入力して<br>「Trace」をクリックしてください</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([35, 135], 3);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors',
+            maxZoom: 18,
+        }).addTo(map);
+
+        let markers = [];
+        let polylines = [];
+
+        function clearMap() {
+            markers.forEach(m => map.removeLayer(m));
+            polylines.forEach(p => map.removeLayer(p));
+            markers = [];
+            polylines = [];
+        }
+
+        function hopColor(index, total) {
+            const hue = (index / total) * 240; // blue to red
+            return `hsl(${240 - hue}, 80%, 55%)`;
+        }
+
+        function setStatus(msg, type) {
+            const el = document.getElementById('status');
+            el.className = 'status ' + type;
+            el.textContent = msg;
+        }
+
+        async function doTrace() {
+            const target = document.getElementById('target').value.trim();
+            if (!target) return;
+
+            const btn = document.getElementById('traceBtn');
+            btn.disabled = true;
+            btn.textContent = '実行中...';
+            setStatus('Traceroute を実行中... (最大60秒)', 'loading');
+            document.getElementById('hopList').innerHTML = '';
+            clearMap();
+
+            try {
+                const resp = await fetch('/api/traceroute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ target, method: document.getElementById('method').value }),
+                });
+                const data = await resp.json();
+
+                if (!resp.ok) {
+                    setStatus(data.error || 'Error', 'error');
+                    return;
+                }
+
+                const hops = data.hops;
+                const total = hops.length;
+                setStatus(`${total} ホップ検出 → ${data.target}`, 'success');
+
+                // Build hop list
+                const listHtml = hops.map((h, i) => {
+                    const loc = h.geo
+                        ? `${h.geo.city}${h.geo.city && h.geo.country ? ', ' : ''}${h.geo.country}`
+                        : '';
+                    const isp = h.geo ? `${h.geo.isp} (${h.geo.as})` : '';
+                    const rtt = h.rtt !== null ? `${h.rtt} ms` : '';
+                    const cls = h.geo ? '' : 'no-geo';
+                    return `<li class="hop-item ${cls}" data-index="${i}" onclick="focusHop(${i})">
+                        <span class="hop-num">${h.hop}</span>
+                        <span class="hop-ip">${h.ip}</span>
+                        <span class="hop-rtt">${rtt}</span>
+                        ${loc ? `<div class="hop-location">${loc}</div>` : ''}
+                        ${isp ? `<div class="hop-isp">${isp}</div>` : ''}
+                    </li>`;
+                }).join('');
+                document.getElementById('hopList').innerHTML = `<ul class="hop-list">${listHtml}</ul>`;
+
+                // Plot on map
+                const geoHops = hops.filter(h => h.geo);
+                const latlngs = [];
+
+                geoHops.forEach((h, i) => {
+                    const lat = h.geo.lat;
+                    const lon = h.geo.lon;
+                    const color = hopColor(i, geoHops.length);
+                    latlngs.push([lat, lon]);
+
+                    const marker = L.circleMarker([lat, lon], {
+                        radius: 7,
+                        fillColor: color,
+                        color: '#fff',
+                        weight: 2,
+                        fillOpacity: 0.9,
+                    }).addTo(map);
+
+                    const loc = `${h.geo.city}${h.geo.city && h.geo.country ? ', ' : ''}${h.geo.country}`;
+                    marker.bindPopup(`
+                        <b>Hop ${h.hop}</b><br>
+                        IP: ${h.ip}<br>
+                        ${loc}<br>
+                        ${h.geo.isp}<br>
+                        RTT: ${h.rtt !== null ? h.rtt + ' ms' : 'N/A'}
+                    `);
+                    markers.push(marker);
+                });
+
+                // Draw route lines
+                if (latlngs.length > 1) {
+                    for (let i = 0; i < latlngs.length - 1; i++) {
+                        const color = hopColor(i, latlngs.length);
+                        const line = L.polyline([latlngs[i], latlngs[i + 1]], {
+                            color: color,
+                            weight: 3,
+                            opacity: 0.7,
+                            dashArray: '8, 6',
+                        }).addTo(map);
+                        polylines.push(line);
+                    }
+                }
+
+                // Fit map bounds
+                if (latlngs.length > 0) {
+                    map.fitBounds(latlngs, { padding: [50, 50] });
+                }
+
+                // Store hops globally for focusHop
+                window._hops = hops;
+
+            } catch (err) {
+                setStatus('通信エラー: ' + err.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Trace';
+            }
+        }
+
+        function focusHop(index) {
+            if (!window._hops || !window._hops[index]) return;
+            const h = window._hops[index];
+            if (h.geo) {
+                map.setView([h.geo.lat, h.geo.lon], 6);
+                // Open popup of matching marker
+                const m = markers.find(m => {
+                    const ll = m.getLatLng();
+                    return Math.abs(ll.lat - h.geo.lat) < 0.001 && Math.abs(ll.lng - h.geo.lon) < 0.001;
+                });
+                if (m) m.openPopup();
+            }
+        }
+
+        // Enter key triggers trace
+        document.getElementById('target').addEventListener('keydown', e => {
+            if (e.key === 'Enter') doTrace();
+        });
+    </script>
+</body>
+</html>
