@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """Traceroute Map - Visualize network routes on a world map."""
 
-import json
 import re
 import subprocess
 import asyncio
+import time
 import aiohttp
+import requests
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
+GLOBALPING_API = "https://api.globalping.io/v1"
+
 
 def run_traceroute(target: str, method: str = 'tcp') -> list[dict]:
-    """Run traceroute and parse hops."""
-    # Validate target (prevent command injection)
+    """Run traceroute locally and parse hops."""
     if not re.match(r'^[a-zA-Z0-9.\-:]+$', target):
         raise ValueError("Invalid target")
     if method not in ('tcp', 'udp', 'icmp'):
@@ -27,25 +29,21 @@ def run_traceroute(target: str, method: str = 'tcp') -> list[dict]:
     cmd.append(target)
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=60
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
         raise TimeoutError("Traceroute timed out")
 
     hops = []
-    for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+    for line in result.stdout.strip().split('\n')[1:]:
         match = re.match(r'\s*(\d+)\s+(.+)', line)
         if not match:
             continue
         hop_num = int(match.group(1))
         rest = match.group(2)
 
-        # Extract first responding IP
         ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', rest)
         if ip_match:
             ip = ip_match.group(1)
-            # Extract RTT
             rtt_match = re.search(r'([\d.]+)\s*ms', rest)
             rtt = float(rtt_match.group(1)) if rtt_match else None
             hops.append({'hop': hop_num, 'ip': ip, 'rtt': rtt})
@@ -55,16 +53,74 @@ def run_traceroute(target: str, method: str = 'tcp') -> list[dict]:
     return hops
 
 
+def run_globalping_traceroute(target: str, location: str) -> list[dict]:
+    """Run traceroute via Globalping API from a specified location."""
+    if not re.match(r'^[a-zA-Z0-9.\-:]+$', target):
+        raise ValueError("Invalid target")
+
+    # Parse location: "JP", "US", "DE", etc.
+    loc_filter = {"country": location.upper()} if len(location) == 2 else {"city": location}
+
+    # Step 1: Create measurement
+    resp = requests.post(f"{GLOBALPING_API}/measurements", json={
+        "target": target,
+        "type": "traceroute",
+        "limit": 1,
+        "locations": [loc_filter],
+    }, timeout=10)
+
+    if resp.status_code == 422:
+        raise ValueError(f"No probes available for location: {location}")
+    resp.raise_for_status()
+    measurement_id = resp.json()["id"]
+
+    # Step 2: Poll for results
+    for _ in range(30):
+        time.sleep(1)
+        r = requests.get(f"{GLOBALPING_API}/measurements/{measurement_id}", timeout=10)
+        data = r.json()
+        if data["status"] == "finished":
+            break
+    else:
+        raise TimeoutError("Globalping measurement timed out")
+
+    result = data["results"][0]
+    probe = result["probe"]
+    gp_hops = result["result"].get("hops", [])
+
+    hops = []
+    for i, hop in enumerate(gp_hops, 1):
+        ip = hop.get("resolvedAddress") or "*"
+        timings = hop.get("timings", [])
+        rtt = timings[0]["rtt"] if timings else None
+        hostname = hop.get("resolvedHostname", "")
+        hops.append({
+            'hop': i,
+            'ip': ip if ip else '*',
+            'rtt': rtt,
+            'hostname': hostname or '',
+        })
+
+    probe_info = {
+        'city': probe.get('city', ''),
+        'country': probe.get('country', ''),
+        'asn': probe.get('asn'),
+        'network': probe.get('network', ''),
+        'lat': probe.get('latitude'),
+        'lon': probe.get('longitude'),
+    }
+
+    return hops, probe_info
+
+
 async def geolocate_ips(ips: list[str]) -> dict:
-    """Batch geolocate IPs using ip-api.com (max 100 per request)."""
-    # Filter out private/reserved IPs and wildcards
+    """Batch geolocate IPs using ip-api.com."""
     valid_ips = [ip for ip in ips if ip != '*' and not _is_private(ip)]
     if not valid_ips:
         return {}
 
     results = {}
     async with aiohttp.ClientSession() as session:
-        # ip-api.com batch endpoint (free, no key needed)
         batch = [{'query': ip} for ip in valid_ips[:100]]
         try:
             async with session.post(
@@ -91,7 +147,6 @@ async def geolocate_ips(ips: list[str]) -> dict:
 
 
 def _is_private(ip: str) -> bool:
-    """Check if an IP is private/reserved."""
     parts = ip.split('.')
     if len(parts) != 4:
         return True
@@ -119,26 +174,37 @@ def api_traceroute():
     data = request.get_json()
     target = data.get('target', '').strip()
     method = data.get('method', 'tcp')
+    source = data.get('source', 'local')
+    location = data.get('location', 'JP')
+
     if not target:
         return jsonify({'error': 'Target is required'}), 400
 
     try:
-        hops = run_traceroute(target, method)
+        if source == 'globalping':
+            hops, probe_info = run_globalping_traceroute(target, location)
+        else:
+            hops = run_traceroute(target, method)
+            probe_info = None
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except TimeoutError as e:
         return jsonify({'error': str(e)}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
     # Geolocate all IPs
     ips = [h['ip'] for h in hops if h['ip'] != '*']
     geo_data = asyncio.run(geolocate_ips(ips))
 
-    # Merge geo data into hops
     for hop in hops:
         if hop['ip'] in geo_data:
             hop['geo'] = geo_data[hop['ip']]
 
-    return jsonify({'target': target, 'hops': hops})
+    result = {'target': target, 'hops': hops}
+    if probe_info:
+        result['probe'] = probe_info
+    return jsonify(result)
 
 
 if __name__ == '__main__':
